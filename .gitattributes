@@ -1,0 +1,15 @@
+# DCF repository line-ending policy
+
+# Linux/container files
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Windows PowerShell
+*.ps1 text eol=crlf
+
+# Documentation/config
+*.md text eol=lf
+*.json text eol=lf
+*.gitignore text eol=lf
