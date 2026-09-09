@@ -1,7 +1,7 @@
-{
+﻿{
   "schema_version": "1.0",
   "name": "DCF CPU WORKER",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "python": "3.12.11",
   "base_image": "python:3.12.11-slim-bookworm",
   "purpose": [
@@ -22,6 +22,6 @@
   ],
   "commands": {
     "healthcheck": "dcf-worker-healthcheck",
-    "comfy_cpu": "dcf-comfy-cpu"
+    "comfy_cpu": "dcf-comfy-cpu",`n    "artifact_transfer": "dcf-artifact-transfer"
   }
 }

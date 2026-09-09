@@ -3,3 +3,6 @@ Thumbs.db
 *.log
 *.tmp
 .env
+
+__pycache__/
+*.pyc

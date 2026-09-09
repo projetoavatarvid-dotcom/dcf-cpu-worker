@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+﻿# syntax=docker/dockerfile:1
 #
 # DCF CPU WORKER v1.0
 #
@@ -19,7 +19,7 @@ ARG S5CMD_VERSION=2.3.0
 
 LABEL org.opencontainers.image.title="DCF CPU Worker"
 LABEL org.opencontainers.image.description="CPU preparation and validation worker for Digital Clone Framework"
-LABEL org.opencontainers.image.version="1.0.1"
+LABEL org.opencontainers.image.version="1.0.2"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -49,12 +49,12 @@ RUN apt-get update \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin uv for reproducibility.
 # Pin s5cmd for reproducible S3-compatible transfers.
 RUN wget -q "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
     && tar -xzf "s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
     && install -m 0755 s5cmd /usr/local/bin/s5cmd \
     && rm -f s5cmd "s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz"
+# Pin uv for reproducibility.
 RUN python -m pip install --no-cache-dir "uv==${UV_VERSION}"
 
 # A normal writable venv avoids the "externally managed interpreter"
@@ -70,10 +70,12 @@ RUN python -m venv /opt/dcf-worker/venv \
 COPY dcf-worker-entrypoint.sh /usr/local/bin/dcf-worker-entrypoint
 COPY dcf-worker-healthcheck.sh /usr/local/bin/dcf-worker-healthcheck
 COPY dcf-comfy-cpu.sh /usr/local/bin/dcf-comfy-cpu
+COPY dcf_artifact_transfer.py /usr/local/bin/dcf-artifact-transfer
 
 RUN chmod 0755 \
     /usr/local/bin/dcf-worker-entrypoint \
     /usr/local/bin/dcf-worker-healthcheck \
+    /usr/local/bin/dcf-artifact-transfer \
     /usr/local/bin/dcf-comfy-cpu
 
 WORKDIR /workspace
