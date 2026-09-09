@@ -15,10 +15,11 @@ FROM python:3.12.11-slim-bookworm
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.8.13
+ARG S5CMD_VERSION=2.3.0
 
 LABEL org.opencontainers.image.title="DCF CPU Worker"
 LABEL org.opencontainers.image.description="CPU preparation and validation worker for Digital Clone Framework"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="1.0.1"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -49,6 +50,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin uv for reproducibility.
+# Pin s5cmd for reproducible S3-compatible transfers.
+RUN wget -q "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
+    && tar -xzf "s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
+    && install -m 0755 s5cmd /usr/local/bin/s5cmd \
+    && rm -f s5cmd "s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz"
 RUN python -m pip install --no-cache-dir "uv==${UV_VERSION}"
 
 # A normal writable venv avoids the "externally managed interpreter"
