@@ -1,4 +1,4 @@
-﻿# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1
 #
 # DCF CPU WORKER v1.0
 #
@@ -19,7 +19,7 @@ ARG S5CMD_VERSION=2.3.0
 
 LABEL org.opencontainers.image.title="DCF CPU Worker"
 LABEL org.opencontainers.image.description="CPU preparation and validation worker for Digital Clone Framework"
-LABEL org.opencontainers.image.version="1.0.2"
+LABEL org.opencontainers.image.version="1.0.3"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
