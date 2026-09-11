@@ -80,6 +80,57 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    result_channel = payload.get("result_channel")
+    normalized_result_channel = None
+
+    if result_channel is not None:
+        if not isinstance(result_channel, dict):
+            raise TransferError("result_channel must be an object")
+
+        transfer_id = _require_text(
+            result_channel.get("transfer_id"),
+            "result_channel.transfer_id",
+        ).lower()
+
+        if not re.fullmatch(r"[0-9a-f]{64}", transfer_id):
+            raise TransferError(
+                "result_channel.transfer_id must be 64 lowercase hex chars"
+            )
+
+        result_key = _require_text(
+            result_channel.get("result_key"),
+            "result_channel.result_key",
+        )
+
+        expected_result_key = (
+            "workflow-preparation/transfer-results/"
+            f"{transfer_id}/result.json"
+        )
+
+        if result_key != expected_result_key:
+            raise TransferError(
+                "result_channel.result_key does not match transfer_id"
+            )
+
+        content_type = _require_text(
+            result_channel.get(
+                "content_type",
+                "application/json",
+            ),
+            "result_channel.content_type",
+        )
+
+        if content_type != "application/json":
+            raise TransferError(
+                "result_channel.content_type must be application/json"
+            )
+
+        normalized_result_channel = {
+            "transfer_id": transfer_id,
+            "result_key": result_key,
+            "content_type": content_type,
+        }
+
     transfer = payload.get("transfer") or {}
     if not isinstance(transfer, dict):
         raise TransferError("transfer must be an object")
@@ -97,6 +148,7 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             "object_workers": object_workers,
             "part_concurrency": part_concurrency,
         },
+        "result_channel": normalized_result_channel,
     }
 
 
@@ -214,6 +266,61 @@ def _upload_with_s5cmd(
     )
 
 
+def _publish_result_json(
+    client: Any,
+    bucket: str,
+    result_channel: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    result_key = result_channel["result_key"]
+
+    if _head_or_none(client, bucket, result_key) is not None:
+        raise TransferError(
+            "result destination already exists; refusing overwrite: "
+            f"{result_key}"
+        )
+
+    body = json.dumps(
+        result,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    try:
+        client.put_object(
+            Bucket=bucket,
+            Key=result_key,
+            Body=body,
+            ContentType=result_channel["content_type"],
+        )
+    except Exception as exc:
+        raise TransferError(
+            f"result publication failed: {type(exc).__name__}"
+        ) from None
+
+    remote = _head_or_none(
+        client,
+        bucket,
+        result_key,
+    )
+
+    if remote is None:
+        raise TransferError(
+            f"result publication verification failed: {result_key}"
+        )
+
+    remote_size = int(
+        remote.get("ContentLength", -1)
+    )
+
+    if remote_size != len(body):
+        raise TransferError(
+            "result publication size mismatch: "
+            f"local={len(body)} remote={remote_size}"
+        )
+
+
 def execute_request(request: dict[str, Any], staging_root: Path = DEFAULT_STAGING_ROOT) -> dict[str, Any]:
     endpoint = _require_text(os.getenv("DCF_R2_ENDPOINT"), "DCF_R2_ENDPOINT")
     bucket = _require_text(os.getenv("DCF_R2_BUCKET"), "DCF_R2_BUCKET")
@@ -287,7 +394,7 @@ def execute_request(request: dict[str, Any], staging_root: Path = DEFAULT_STAGIN
             if verified and local_path.exists():
                 local_path.unlink()
 
-    return {
+    result = {
         "schema_version": "1.0",
         "status": "COMPLETED",
         "mode": "SEQUENTIAL",
@@ -296,6 +403,18 @@ def execute_request(request: dict[str, Any], staging_root: Path = DEFAULT_STAGIN
         "catalog_write_performed": False,
         "artifacts": evidence,
     }
+
+    result_channel = request.get("result_channel")
+
+    if result_channel is not None:
+        _publish_result_json(
+            client,
+            bucket,
+            result_channel,
+            result,
+        )
+
+    return result
 
 
 def main() -> int:
