@@ -1,5 +1,6 @@
-﻿import os
+import os
 import unittest
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -127,3 +128,200 @@ class ArtifactTransferValidationTests(unittest.TestCase):
         self.assertNotIn("super-secret-token", message)
 if __name__ == "__main__":
     unittest.main()
+def test_model_artifact_keeps_legacy_default():
+    request = ArtifactTransferValidationTests().request()
+    result = transfer.validate_request(request)
+
+    artifact = result["artifacts"][0]
+
+    assert artifact["artifact_type"] == "MODEL_ARTIFACT"
+    assert artifact["r2_key"].startswith("models/")
+    assert artifact["repository_path"] == "vae/example.safetensors"
+
+
+def test_accepts_custom_node_package_with_exact_commit():
+    request = {
+        "schema_version": "1.0",
+        "artifacts": [{
+            "artifact_type": "CUSTOM_NODE_PACKAGE",
+            "repository": "example-owner/example-node",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "r2_key": (
+                "custom-nodes/example-owner/example-node/"
+                "0123456789abcdef0123456789abcdef01234567/source.zip"
+            ),
+            "gated": False,
+        }],
+    }
+
+    result = transfer.validate_request(request)
+    artifact = result["artifacts"][0]
+
+    assert artifact["artifact_type"] == "CUSTOM_NODE_PACKAGE"
+    assert artifact["repository"] == "example-owner/example-node"
+    assert artifact["revision"] == "0123456789abcdef0123456789abcdef01234567"
+    assert "repository_path" not in artifact
+
+
+def test_custom_node_package_requires_exact_commit():
+    request = {
+        "schema_version": "1.0",
+        "artifacts": [{
+            "artifact_type": "CUSTOM_NODE_PACKAGE",
+            "repository": "example-owner/example-node",
+            "revision": "main",
+            "r2_key": "custom-nodes/example-owner/example-node/main/source.zip",
+        }],
+    }
+
+    with pytest.raises(transfer.TransferError, match="exact 40-char Git commit"):
+        transfer.validate_request(request)
+
+
+def test_custom_node_package_requires_custom_nodes_namespace():
+    request = {
+        "schema_version": "1.0",
+        "artifacts": [{
+            "artifact_type": "CUSTOM_NODE_PACKAGE",
+            "repository": "example-owner/example-node",
+            "revision": "0123456789abcdef0123456789abcdef01234567",
+            "r2_key": "models/not-allowed.zip",
+        }],
+    }
+
+    with pytest.raises(transfer.TransferError, match="custom-nodes/"):
+        transfer.validate_request(request)
+
+def test_github_archive_url_uses_exact_commit():
+    commit = "0123456789abcdef0123456789abcdef01234567"
+
+    url = transfer._github_archive_url(
+        "example-owner/example-node",
+        commit,
+    )
+
+    assert url == (
+        "https://codeload.github.com/"
+        "example-owner/example-node/zip/"
+        + commit
+    )
+
+
+def test_custom_node_download_dispatches_to_github():
+    artifact = {
+        "artifact_type": "CUSTOM_NODE_PACKAGE",
+        "repository": "example-owner/example-node",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "r2_key": (
+            "custom-nodes/example-owner/example-node/"
+            "0123456789abcdef0123456789abcdef01234567/source.zip"
+        ),
+        "gated": False,
+    }
+
+    with patch.object(
+        transfer,
+        "_download_github_package",
+        return_value=(123, "a" * 64),
+    ) as github_download, patch.object(
+        transfer,
+        "_download_huggingface",
+    ) as hf_download:
+
+        result = transfer._download(
+            artifact,
+            Path("unused.part"),
+            None,
+        )
+
+    assert result == (123, "a" * 64)
+    github_download.assert_called_once()
+    hf_download.assert_not_called()
+
+
+def test_model_download_still_dispatches_to_huggingface():
+    request = ArtifactTransferValidationTests().request()
+    artifact = transfer.validate_request(request)["artifacts"][0]
+
+    with patch.object(
+        transfer,
+        "_download_huggingface",
+        return_value=(123, "b" * 64),
+    ) as hf_download, patch.object(
+        transfer,
+        "_download_github_package",
+    ) as github_download:
+
+        result = transfer._download(
+            artifact,
+            Path("unused.part"),
+            "token",
+        )
+
+    assert result == (123, "b" * 64)
+    hf_download.assert_called_once()
+    github_download.assert_not_called()
+
+def test_inspects_custom_node_dependency_manifests(tmp_path):
+    archive_path = tmp_path / "node.zip"
+
+    import zipfile
+
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "example-node-abc123/requirements.txt",
+            "requests\n",
+        )
+        archive.writestr(
+            "example-node-abc123/requirements/extra.txt",
+            "numpy\n",
+        )
+        archive.writestr(
+            "example-node-abc123/pyproject.toml",
+            "[build-system]\n",
+        )
+        archive.writestr(
+            "example-node-abc123/nodes.py",
+            "print('not executed')\n",
+        )
+
+    result = transfer._inspect_custom_node_requirements(
+        archive_path
+    )
+
+    assert result == [
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements/extra.txt",
+    ]
+
+
+def test_custom_node_requirement_inspection_does_not_execute_code(tmp_path):
+    archive_path = tmp_path / "node.zip"
+
+    import zipfile
+
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "node/setup.py",
+            "raise RuntimeError('MUST NOT RUN')\n",
+        )
+
+    result = transfer._inspect_custom_node_requirements(
+        archive_path
+    )
+
+    assert result == ["setup.py"]
+
+
+def test_invalid_custom_node_zip_is_rejected(tmp_path):
+    archive_path = tmp_path / "invalid.zip"
+    archive_path.write_bytes(b"not-a-zip")
+
+    with pytest.raises(
+        transfer.TransferError,
+        match="not a valid ZIP archive",
+    ):
+        transfer._inspect_custom_node_requirements(
+            archive_path
+        )
