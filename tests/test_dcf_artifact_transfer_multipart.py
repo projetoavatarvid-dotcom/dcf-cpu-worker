@@ -268,6 +268,72 @@ def test_execute_request_routes_model_to_streaming_without_staging(
 
 
 
+def test_model_retry_recovers_transient_failure_in_same_pod(monkeypatch):
+    payload = b"abcdef"
+    artifact = _artifact(payload)
+    calls = {"count": 0}
+    sleeps = []
+
+    def flaky_stream(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("ChunkedEncodingError")
+        return len(payload), hashlib.sha256(payload).hexdigest()
+
+    monkeypatch.setattr(
+        transfer,
+        "_stream_huggingface_to_r2_multipart",
+        flaky_stream,
+    )
+
+    result = transfer._stream_model_with_retry(
+        artifact,
+        object(),
+        "bucket",
+        None,
+        attempts=3,
+        backoff_seconds=0.25,
+        sleeper=sleeps.append,
+    )
+
+    assert result == (
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+    )
+    assert calls["count"] == 2
+    assert sleeps == [0.25]
+
+
+def test_model_retry_stops_after_bounded_attempts(monkeypatch):
+    artifact = _artifact(b"abcdef")
+    calls = {"count": 0}
+
+    def always_fails(*args, **kwargs):
+        calls["count"] += 1
+        raise RuntimeError("IncompleteRead")
+
+    monkeypatch.setattr(
+        transfer,
+        "_stream_huggingface_to_r2_multipart",
+        always_fails,
+    )
+
+    with pytest.raises(
+        transfer.TransferError,
+        match="failed after 3 attempts",
+    ):
+        transfer._stream_model_with_retry(
+            artifact,
+            object(),
+            "bucket",
+            None,
+            attempts=3,
+            backoff_seconds=0,
+        )
+
+    assert calls["count"] == 3
+
+
 def test_default_multipart_part_size_is_64_mib_for_normal_models():
     assert transfer._select_multipart_part_size(
         20 * 1024 * 1024 * 1024

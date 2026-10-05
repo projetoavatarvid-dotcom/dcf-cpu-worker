@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from urllib.parse import quote
 DEFAULT_STAGING_ROOT = Path("/tmp/dcf-artifact-transfer")
 DEFAULT_OBJECT_WORKERS = 32
 DEFAULT_PART_CONCURRENCY = 80
+DEFAULT_DOWNLOAD_ATTEMPTS = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
 
 
 class TransferError(RuntimeError):
@@ -704,6 +707,52 @@ def _stream_huggingface_to_r2_multipart(
         raise
 
 
+def _stream_model_with_retry(
+    artifact: dict[str, Any],
+    client: Any,
+    bucket: str,
+    hf_token: str | None,
+    *,
+    attempts: int = DEFAULT_DOWNLOAD_ATTEMPTS,
+    backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+    sleeper=time.sleep,
+) -> tuple[int, str]:
+    if attempts <= 0:
+        raise TransferError("download attempts must be positive")
+
+    last_error: BaseException | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return _stream_huggingface_to_r2_multipart(
+                artifact,
+                client,
+                bucket,
+                hf_token,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            print(
+                "WARN - model transfer attempt "
+                f"{attempt}/{attempts} failed for {artifact['r2_key']}: "
+                f"{type(exc).__name__}; retrying in same Pod",
+                file=sys.stderr,
+                flush=True,
+            )
+            if backoff_seconds > 0:
+                sleeper(backoff_seconds * attempt)
+
+    raise TransferError(
+        "model transfer failed after "
+        f"{attempts} attempts for {artifact['r2_key']}: "
+        f"{type(last_error).__name__}"
+    ) from last_error
+
+
 def execute_request(
     request: dict[str, Any],
     staging_root: Path = DEFAULT_STAGING_ROOT,
@@ -755,7 +804,7 @@ def execute_request(
         local_path = None
 
         if artifact["artifact_type"] == "MODEL_ARTIFACT":
-            size, digest = _stream_huggingface_to_r2_multipart(
+            size, digest = _stream_model_with_retry(
                 artifact,
                 client,
                 bucket,
