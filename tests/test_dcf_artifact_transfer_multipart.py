@@ -83,6 +83,7 @@ def test_model_streams_directly_to_r2_multipart(monkeypatch):
     )
 
     client = FakeR2()
+    progress = []
 
     size, digest = (
         transfer._stream_huggingface_to_r2_multipart(
@@ -92,6 +93,9 @@ def test_model_streams_directly_to_r2_multipart(monkeypatch):
             None,
             part_size=6,
             chunk_size=4,
+            progress_callback=lambda done, total: progress.append(
+                (done, total)
+            ),
         )
     )
 
@@ -101,6 +105,7 @@ def test_model_streams_directly_to_r2_multipart(monkeypatch):
     assert len(client.parts) == 3
     assert client.completed is True
     assert client.aborted is False
+    assert progress == [(6, 16), (12, 16), (16, 16)]
 
 
 def test_multipart_is_aborted_on_size_mismatch(monkeypatch):

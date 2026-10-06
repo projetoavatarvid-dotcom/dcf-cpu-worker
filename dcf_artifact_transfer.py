@@ -455,6 +455,27 @@ def _upload_with_s5cmd(
     )
 
 
+def _publish_progress_json(
+    client: Any,
+    bucket: str,
+    result_channel: dict[str, Any],
+    progress: dict[str, Any],
+) -> None:
+    progress_key = result_channel["result_key"].rsplit("/", 1)[0] + "/progress.json"
+    body = json.dumps(
+        progress,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    client.put_object(
+        Bucket=bucket,
+        Key=progress_key,
+        Body=body,
+        ContentType="application/json",
+    )
+
+
 def _publish_result_json(
     client: Any,
     bucket: str,
@@ -558,6 +579,7 @@ def _stream_huggingface_to_r2_multipart(
     *,
     part_size: int | None = None,
     chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+    progress_callback: Any = None,
 ) -> tuple[int, str]:
     """
     Stream a MODEL_ARTIFACT directly from Hugging Face to R2 using
@@ -597,6 +619,7 @@ def _stream_huggingface_to_r2_multipart(
     upload_id = multipart["UploadId"]
     uploaded_parts = []
     part_number = 1
+    uploaded_bytes = 0
     size = 0
     sha256 = hashlib.sha256()
     buffer = bytearray()
@@ -644,6 +667,12 @@ def _stream_huggingface_to_r2_multipart(
                             "PartNumber": part_number,
                         }
                     )
+                    uploaded_bytes += len(body)
+                    if progress_callback is not None:
+                        progress_callback(
+                            uploaded_bytes,
+                            artifact["expected_size_bytes"],
+                        )
                     part_number += 1
 
         if buffer:
@@ -661,6 +690,12 @@ def _stream_huggingface_to_r2_multipart(
                     "PartNumber": part_number,
                 }
             )
+            uploaded_bytes += len(buffer)
+            if progress_callback is not None:
+                progress_callback(
+                    uploaded_bytes,
+                    artifact["expected_size_bytes"],
+                )
 
         expected_size = artifact["expected_size_bytes"]
         if size != expected_size:
@@ -716,6 +751,7 @@ def _stream_model_with_retry(
     attempts: int = DEFAULT_DOWNLOAD_ATTEMPTS,
     backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
     sleeper=time.sleep,
+    progress_callback: Any = None,
 ) -> tuple[int, str]:
     if attempts <= 0:
         raise TransferError("download attempts must be positive")
@@ -729,6 +765,16 @@ def _stream_model_with_retry(
                 client,
                 bucket,
                 hf_token,
+                progress_callback=(
+                    None
+                    if progress_callback is None
+                    else lambda done, total: progress_callback(
+                        attempt,
+                        attempts,
+                        done,
+                        total,
+                    )
+                ),
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -788,6 +834,8 @@ def execute_request(
 
     staging_root.mkdir(parents=True, exist_ok=True)
     evidence = []
+    result_channel = request.get("result_channel")
+    transfer_started_at = time.monotonic()
 
     for artifact in request["artifacts"]:
         if _head_or_none(
@@ -804,11 +852,35 @@ def execute_request(
         local_path = None
 
         if artifact["artifact_type"] == "MODEL_ARTIFACT":
+            def publish_progress(attempt, attempts, done, total):
+                if result_channel is None:
+                    return
+                elapsed = max(time.monotonic() - transfer_started_at, 0.001)
+                _publish_progress_json(
+                    client,
+                    bucket,
+                    result_channel,
+                    {
+                        "schema_version": "1.0",
+                        "status": "RUNNING",
+                        "transfer_id": result_channel["transfer_id"],
+                        "r2_key": artifact["r2_key"],
+                        "attempt": attempt,
+                        "attempts": attempts,
+                        "bytes_uploaded": done,
+                        "expected_size_bytes": total,
+                        "percent": round((done / total) * 100, 2),
+                        "bytes_per_second": round(done / elapsed, 2),
+                        "elapsed_seconds": round(elapsed, 2),
+                    },
+                )
+
             size, digest = _stream_model_with_retry(
                 artifact,
                 client,
                 bucket,
                 hf_token,
+                progress_callback=publish_progress,
             )
 
             transfer_method = "R2_MULTIPART_STREAMING"
