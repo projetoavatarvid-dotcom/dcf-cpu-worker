@@ -268,6 +268,50 @@ def test_execute_request_routes_model_to_streaming_without_staging(
 
 
 
+def test_parallel_uploads_are_in_flight_and_parts_complete_in_order(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    payload = b"abcdefghijklmnop"
+    monkeypatch.setitem(
+        sys.modules, "requests",
+        SimpleNamespace(get=lambda *a, **k: FakeResponse([payload])),
+    )
+    client = FakeR2()
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    barrier = threading.Barrier(2, timeout=3)
+
+    def concurrent_upload(**kwargs):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        barrier.wait()
+        with lock:
+            active -= 1
+        return {"ETag": f'"etag-{kwargs["PartNumber"]}"'}
+
+    client.upload_part = concurrent_upload
+    completed = {}
+
+    def complete(**kwargs):
+        completed.update(kwargs)
+        client.completed = True
+
+    client.complete_multipart_upload = complete
+    size, digest = transfer._stream_huggingface_to_r2_multipart(
+        _artifact(payload), client, "bucket", None,
+        part_size=4, chunk_size=4, upload_workers=2,
+    )
+    assert maximum == 2
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert [part["PartNumber"] for part in completed["MultipartUpload"]["Parts"]] == [1, 2, 3, 4]
+    assert client.completed and not client.aborted
+
+
 def test_default_multipart_part_size_is_64_mib_for_normal_models():
     assert transfer._select_multipart_part_size(
         20 * 1024 * 1024 * 1024
