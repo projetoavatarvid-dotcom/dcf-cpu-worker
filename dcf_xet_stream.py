@@ -8,7 +8,7 @@ class XetStreamError(RuntimeError):
     pass
 
 
-def transfer_xet_stream_to_r2(artifact, client, bucket, hf_token, *, part_size=64*1024*1024, upload_workers=4):
+def transfer_xet_stream_to_r2(artifact, client, bucket, hf_token, *, part_size=32*1024*1024, upload_workers=2):
     from hf_xet import XetFileInfo
     from huggingface_hub.file_download import get_hf_file_metadata, hf_hub_url
     from huggingface_hub.utils._headers import build_hf_headers
