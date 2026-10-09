@@ -864,10 +864,11 @@ def execute_request(
                 )
                 transfer_method = "R2_MULTIPART_STREAMING"
             else:
-                size, digest = _transfer_model_via_xet(
-                    artifact, client, bucket, hf_token, staging_root,
+                from dcf_xet_stream import transfer_xet_stream_to_r2
+                size, digest = transfer_xet_stream_to_r2(
+                    artifact, client, bucket, hf_token,
                 )
-                transfer_method = "HF_XET_NATIVE_R2_MULTIPART"
+                transfer_method = "HF_XET_STREAM_R2_MULTIPART"
 
         elif artifact["artifact_type"] == "CUSTOM_NODE_PACKAGE":
             repository_name = artifact["repository"].rsplit("/", 1)[-1]

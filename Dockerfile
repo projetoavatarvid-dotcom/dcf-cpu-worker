@@ -65,12 +65,13 @@ RUN python -m venv /opt/dcf-worker/venv \
     && /opt/dcf-worker/venv/bin/python -m pip install --no-cache-dir \
         requests \
         boto3 \
-        huggingface_hub
-
+        "huggingface_hub==1.30.0" \
+        "hf-xet==1.6.0"
 COPY dcf-worker-entrypoint.sh /usr/local/bin/dcf-worker-entrypoint
 COPY dcf-worker-healthcheck.sh /usr/local/bin/dcf-worker-healthcheck
 COPY dcf-comfy-cpu.sh /usr/local/bin/dcf-comfy-cpu
 COPY dcf_artifact_transfer.py /usr/local/bin/dcf-artifact-transfer
+COPY dcf_xet_stream.py /usr/local/bin/dcf_xet_stream.py
 
 RUN chmod 0755 \
     /usr/local/bin/dcf-worker-entrypoint \
@@ -85,3 +86,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/dcf-worker-entrypoint"]
 CMD ["sleep","infinity"]
+
