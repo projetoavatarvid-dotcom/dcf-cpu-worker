@@ -555,149 +555,99 @@ def _stream_huggingface_to_r2_multipart(
     *,
     part_size: int | None = None,
     chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
+    upload_workers: int = 4,
 ) -> tuple[int, str]:
-    """
-    Stream a MODEL_ARTIFACT directly from Hugging Face to R2 using
-    S3 multipart upload.
+    """Bounded streaming pipeline: Hugging Face download and parallel R2 uploads.
 
-    No complete local copy is created.
+    Keeps at most upload_workers + 1 parts in memory; never stages the model.
+    Multipart is completed only after size and digest validation.
     """
     import requests
+    from concurrent.futures import ThreadPoolExecutor
 
     if artifact.get("artifact_type") != "MODEL_ARTIFACT":
-        raise TransferError(
-            "multipart streaming is supported only for MODEL_ARTIFACT"
-        )
-
+        raise TransferError("multipart streaming is supported only for MODEL_ARTIFACT")
     if part_size is None:
-        part_size = _select_multipart_part_size(
-            artifact["expected_size_bytes"]
-        )
-
-    if part_size <= 0:
-        raise TransferError("multipart part_size must be positive")
-
-    if chunk_size <= 0:
-        raise TransferError("multipart chunk_size must be positive")
+        part_size = _select_multipart_part_size(artifact["expected_size_bytes"])
+    if part_size <= 0 or chunk_size <= 0:
+        raise TransferError("multipart part_size and chunk_size must be positive")
+    if not 1 <= upload_workers <= 16:
+        raise TransferError("upload_workers must be between 1 and 16")
 
     headers = {}
     if hf_token:
         headers["Authorization"] = f"Bearer {hf_token}"
-
     r2_key = artifact["r2_key"]
-
-    multipart = client.create_multipart_upload(
-        Bucket=bucket,
-        Key=r2_key,
-    )
-
+    multipart = client.create_multipart_upload(Bucket=bucket, Key=r2_key)
     upload_id = multipart["UploadId"]
     uploaded_parts = []
+    pending = []
     part_number = 1
     size = 0
     sha256 = hashlib.sha256()
     buffer = bytearray()
 
+    def send_part(number, body):
+        result = client.upload_part(
+            Bucket=bucket, Key=r2_key, UploadId=upload_id,
+            PartNumber=number, Body=body,
+        )
+        return {"ETag": result["ETag"], "PartNumber": number}
+
     try:
-        with requests.get(
-            _hf_url(
-                artifact["repository"],
-                artifact["revision"],
-                artifact["repository_path"],
-            ),
-            headers=headers,
-            stream=True,
-            timeout=(30, 300),
-        ) as response:
-            if response.status_code >= 400:
-                raise TransferError(
-                    "Hugging Face download failed: "
-                    f"HTTP {response.status_code}"
-                )
-
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if not chunk:
-                    continue
-
-                size += len(chunk)
-                sha256.update(chunk)
-                buffer.extend(chunk)
-
-                while len(buffer) >= part_size:
-                    body = bytes(buffer[:part_size])
-                    del buffer[:part_size]
-
-                    uploaded = client.upload_part(
-                        Bucket=bucket,
-                        Key=r2_key,
-                        UploadId=upload_id,
-                        PartNumber=part_number,
-                        Body=body,
+        with ThreadPoolExecutor(max_workers=upload_workers) as pool:
+            with requests.get(
+                _hf_url(
+                    artifact["repository"], artifact["revision"],
+                    artifact["repository_path"],
+                ),
+                headers=headers, stream=True, timeout=(30, 300),
+            ) as response:
+                if response.status_code >= 400:
+                    raise TransferError(
+                        f"Hugging Face download failed: HTTP {response.status_code}"
                     )
-
-                    uploaded_parts.append(
-                        {
-                            "ETag": uploaded["ETag"],
-                            "PartNumber": part_number,
-                        }
-                    )
-                    part_number += 1
-
-        if buffer:
-            uploaded = client.upload_part(
-                Bucket=bucket,
-                Key=r2_key,
-                UploadId=upload_id,
-                PartNumber=part_number,
-                Body=bytes(buffer),
-            )
-
-            uploaded_parts.append(
-                {
-                    "ETag": uploaded["ETag"],
-                    "PartNumber": part_number,
-                }
-            )
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    sha256.update(chunk)
+                    buffer.extend(chunk)
+                    while len(buffer) >= part_size:
+                        body = bytes(buffer[:part_size])
+                        del buffer[:part_size]
+                        pending.append(pool.submit(send_part, part_number, body))
+                        part_number += 1
+                        if len(pending) >= upload_workers:
+                            uploaded_parts.append(pending.pop(0).result())
+            if buffer:
+                pending.append(pool.submit(send_part, part_number, bytes(buffer)))
+            for future in pending:
+                uploaded_parts.append(future.result())
 
         expected_size = artifact["expected_size_bytes"]
         if size != expected_size:
             raise TransferError(
-                "download size mismatch: "
-                f"expected={expected_size} actual={size}"
+                f"download size mismatch: expected={expected_size} actual={size}"
             )
-
         digest = sha256.hexdigest()
         expected_sha256 = artifact.get("expected_sha256")
-
-        if (
-            expected_sha256
-            and digest.lower() != expected_sha256.lower()
-        ):
+        if expected_sha256 and digest.lower() != expected_sha256.lower():
             raise TransferError(
-                "sha256 mismatch: "
-                f"expected={expected_sha256} actual={digest}"
+                f"sha256 mismatch: expected={expected_sha256} actual={digest}"
             )
-
         if not uploaded_parts:
-            raise TransferError(
-                "Hugging Face download produced an empty artifact"
-            )
-
+            raise TransferError("Hugging Face download produced an empty artifact")
+        uploaded_parts.sort(key=lambda part: part["PartNumber"])
         client.complete_multipart_upload(
-            Bucket=bucket,
-            Key=r2_key,
-            UploadId=upload_id,
+            Bucket=bucket, Key=r2_key, UploadId=upload_id,
             MultipartUpload={"Parts": uploaded_parts},
         )
-
         return size, digest
-
     except BaseException:
         try:
             client.abort_multipart_upload(
-                Bucket=bucket,
-                Key=r2_key,
-                UploadId=upload_id,
+                Bucket=bucket, Key=r2_key, UploadId=upload_id,
             )
         except Exception:
             pass
