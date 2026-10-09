@@ -334,3 +334,66 @@ def test_multipart_part_size_grows_for_very_large_models():
     ) // part_size
 
     assert part_count <= transfer.MAX_MULTIPART_PARTS
+
+
+def test_parallel_ranges_integrity_and_order(monkeypatch):
+    import sys
+    import types
+    from unittest.mock import Mock
+
+    payload = b"abcdefghijklmnop"
+    calls = []
+
+    class Response:
+        status_code = 206
+        def __init__(self, start, end):
+            self.headers = {"Content-Range": f"bytes {start}-{end}/{len(payload)}"}
+            self.data = payload[start:end + 1]
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def iter_content(self, chunk_size):
+            yield self.data
+
+    def get(url, *, headers, **kwargs):
+        start, end = map(int, headers["Range"][6:].split("-"))
+        calls.append((start, end))
+        return Response(start, end)
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(
+        get=get, RequestException=Exception,
+    ))
+    client = Mock()
+    client.create_multipart_upload.return_value = {"UploadId": "u"}
+    client.upload_part.side_effect = lambda **kw: {"ETag": str(kw["PartNumber"])}
+    artifact = _artifact(payload)
+    size, digest = transfer._parallel_huggingface_to_r2_multipart(
+        artifact, client, "bucket", None, part_size=5, download_workers=3,
+    )
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert sorted(calls) == [(0, 4), (5, 9), (10, 14), (15, 15)]
+    parts = client.complete_multipart_upload.call_args.kwargs["MultipartUpload"]["Parts"]
+    assert [p["PartNumber"] for p in parts] == [1, 2, 3, 4]
+    client.abort_multipart_upload.assert_not_called()
+
+
+def test_parallel_range_rejects_ignored_ranges(monkeypatch):
+    import sys
+    import types
+
+    class Response:
+        status_code = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(
+        get=lambda *a, **kw: Response(), RequestException=Exception,
+    ))
+    with pytest.raises(transfer.TransferError, match="HTTP Range unsupported"):
+        transfer._parallel_huggingface_to_r2_multipart(
+            _artifact(b"abcdefghijkl"), object(), "bucket", None, part_size=5,
+        )

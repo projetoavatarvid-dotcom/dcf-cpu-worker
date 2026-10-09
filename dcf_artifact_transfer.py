@@ -654,6 +654,109 @@ def _stream_huggingface_to_r2_multipart(
         raise
 
 
+def _parallel_huggingface_to_r2_multipart(
+    artifact: dict[str, Any], client: Any, bucket: str, hf_token: str | None,
+    *, part_size: int | None = None, download_workers: int = 8,
+) -> tuple[int, str]:
+    """Bounded HTTP Range downloads, parallel multipart uploads, ordered SHA-256.
+
+    Rejects servers that ignore ranges; caller may fall back to streaming.
+    """
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+
+    expected = artifact["expected_size_bytes"]
+    if part_size is None:
+        part_size = _select_multipart_part_size(expected)
+    if expected <= 0 or part_size <= 0 or not 1 <= download_workers <= 16:
+        raise TransferError("invalid parallel download parameters")
+    url = _hf_url(artifact["repository"], artifact["revision"], artifact["repository_path"])
+    headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+    key = artifact["r2_key"]
+    count = (expected + part_size - 1) // part_size
+
+    def fetch(number: int) -> bytes:
+        start = (number - 1) * part_size
+        end = min(start + part_size, expected) - 1
+        for attempt in range(3):
+            try:
+                with requests.get(url, headers={**headers, "Range": f"bytes={start}-{end}"},
+                                  stream=True, timeout=(30, 180)) as response:
+                    if response.status_code != 206:
+                        raise TransferError(f"HTTP Range unsupported: {response.status_code}")
+                    if response.headers.get("Content-Range", "").split("/")[0] != f"bytes {start}-{end}":
+                        raise TransferError("HTTP Range Content-Range mismatch")
+                    data = bytearray()
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        data.extend(chunk)
+                        if len(data) > end - start + 1:
+                            raise TransferError("HTTP Range exceeded expected length")
+                    if len(data) != end - start + 1:
+                        raise TransferError("HTTP Range truncated")
+                    return bytes(data)
+            except (requests.RequestException, TransferError):
+                if attempt == 2:
+                    raise
+        raise TransferError("range retries exhausted")
+
+    # Probe before allocating an R2 multipart upload.
+    first = fetch(1)
+    upload_id = client.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
+    digest = hashlib.sha256()
+    parts = []
+    try:
+        def send(number: int, body: bytes):
+            result = client.upload_part(Bucket=bucket, Key=key, UploadId=upload_id,
+                                        PartNumber=number, Body=body)
+            return {"PartNumber": number, "ETag": result["ETag"]}
+
+        with ThreadPoolExecutor(max_workers=download_workers) as downloads, ThreadPoolExecutor(max_workers=4) as uploads:
+            pending = {}
+            next_number = 2
+            uploaded = []
+            for number in range(1, count + 1):
+                while next_number <= count and len(pending) < download_workers:
+                    pending[next_number] = downloads.submit(fetch, next_number)
+                    next_number += 1
+                body = first if number == 1 else pending.pop(number).result()
+                digest.update(body)
+                uploaded.append(uploads.submit(send, number, body))
+                # Keep upload buffers bounded too.
+                if len(uploaded) >= 4:
+                    parts.append(uploaded.pop(0).result())
+            parts.extend(f.result() for f in uploaded)
+        actual_sha = digest.hexdigest()
+        expected_sha = artifact.get("expected_sha256")
+        if expected_sha and actual_sha.lower() != expected_sha.lower():
+            raise TransferError("parallel download sha256 mismatch")
+        client.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": sorted(parts, key=lambda p: p["PartNumber"])},
+        )
+        return expected, actual_sha
+    except BaseException:
+        try:
+            client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+        except Exception:
+            pass
+        raise
+
+
+def _transfer_large_model_parallel(artifact, client, bucket, hf_token):
+    try:
+        size, digest = _parallel_huggingface_to_r2_multipart(
+            artifact, client, bucket, hf_token,
+        )
+        return size, digest, "HF_PARALLEL_RANGE_R2_MULTIPART"
+    except TransferError as error:
+        if not str(error).startswith(("HTTP Range unsupported", "HTTP Range Content-Range mismatch")):
+            raise
+        size, digest = _stream_huggingface_to_r2_multipart(
+            artifact, client, bucket, hf_token,
+        )
+        return size, digest, "R2_MULTIPART_STREAMING_FALLBACK"
+
+
 def execute_request(
     request: dict[str, Any],
     staging_root: Path = DEFAULT_STAGING_ROOT,
@@ -705,14 +808,15 @@ def execute_request(
         local_path = None
 
         if artifact["artifact_type"] == "MODEL_ARTIFACT":
-            size, digest = _stream_huggingface_to_r2_multipart(
-                artifact,
-                client,
-                bucket,
-                hf_token,
-            )
-
-            transfer_method = "R2_MULTIPART_STREAMING"
+            if artifact["expected_size_bytes"] < DEFAULT_MULTIPART_PART_SIZE:
+                size, digest = _stream_huggingface_to_r2_multipart(
+                    artifact, client, bucket, hf_token,
+                )
+                transfer_method = "R2_MULTIPART_STREAMING"
+            else:
+                size, digest, transfer_method = _transfer_large_model_parallel(
+                    artifact, client, bucket, hf_token,
+                )
 
         elif artifact["artifact_type"] == "CUSTOM_NODE_PACKAGE":
             repository_name = artifact["repository"].rsplit("/", 1)[-1]
