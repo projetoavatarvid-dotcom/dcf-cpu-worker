@@ -397,3 +397,34 @@ def test_parallel_range_rejects_ignored_ranges(monkeypatch):
         transfer._parallel_huggingface_to_r2_multipart(
             _artifact(b"abcdefghijkl"), object(), "bucket", None, part_size=5,
         )
+
+def test_xet_download_upload_and_integrity(monkeypatch, tmp_path):
+    import sys, types, hashlib
+    payload = b"xet-native-payload"
+    source = tmp_path / "source.bin"
+    source.write_bytes(payload)
+    artifact = _artifact(payload)
+    artifact["expected_size_bytes"] = len(payload)
+    artifact["expected_sha256"] = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr(transfer.shutil if hasattr(transfer, "shutil") else __import__("shutil"), "disk_usage", lambda p: types.SimpleNamespace(free=10**12))
+    hub = types.ModuleType("huggingface_hub")
+    hub.hf_hub_download = lambda **kw: str(source)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    class Client:
+        def __init__(self): self.data = None
+        def upload_fileobj(self, f, bucket, key, Config=None): self.data = f.read()
+    client = Client()
+    size, digest = transfer._transfer_model_via_xet(artifact, client, "bucket", None, tmp_path / "stage")
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert client.data == payload
+
+
+def test_xet_rejects_insufficient_staging_space(monkeypatch, tmp_path):
+    import shutil, types
+    payload = b"x" * 10
+    artifact = _artifact(payload)
+    artifact["expected_size_bytes"] = len(payload)
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: types.SimpleNamespace(free=1))
+    with pytest.raises(transfer.TransferError, match="Xet staging requires"):
+        transfer._transfer_model_via_xet(artifact, object(), "bucket", None, tmp_path / "stage")

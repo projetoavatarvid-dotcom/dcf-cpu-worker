@@ -757,6 +757,56 @@ def _transfer_large_model_parallel(artifact, client, bucket, hf_token):
         return size, digest, "R2_MULTIPART_STREAMING_FALLBACK"
 
 
+def _transfer_model_via_xet(artifact, client, bucket, hf_token, staging_root):
+    """Native hf_xet download followed by verified R2 multipart upload."""
+    import os
+    import shutil
+    import tempfile
+    from huggingface_hub import hf_hub_download
+    from boto3.s3.transfer import TransferConfig
+
+    expected = artifact["expected_size_bytes"]
+    staging_root.mkdir(parents=True, exist_ok=True)
+    # Xet reconstructs a complete local file. Allow temporary reconstruction overhead.
+    required = expected * 2 + 1024 * 1024 * 1024
+    if shutil.disk_usage(staging_root).free < required:
+        raise TransferError(
+            f"Xet staging requires at least {required} free bytes; "
+            f"available={shutil.disk_usage(staging_root).free}"
+        )
+    with tempfile.TemporaryDirectory(prefix="dcf-xet-", dir=staging_root) as temp:
+        cache = os.path.join(temp, "cache")
+        path = hf_hub_download(
+            repo_id=artifact["repository"],
+            filename=artifact["repository_path"],
+            revision=artifact["revision"],
+            token=hf_token,
+            cache_dir=cache,
+        )
+        size = os.path.getsize(path)
+        if size != expected:
+            raise TransferError(f"Xet size mismatch: expected={expected} actual={size}")
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for block in iter(lambda: source.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        calculated = digest.hexdigest()
+        expected_sha = artifact.get("expected_sha256")
+        if expected_sha and calculated.lower() != expected_sha.lower():
+            raise TransferError("Xet sha256 mismatch")
+        with open(path, "rb") as source:
+            client.upload_fileobj(
+                source, bucket, artifact["r2_key"],
+                Config=TransferConfig(
+                    multipart_threshold=8 * 1024 * 1024,
+                    multipart_chunksize=64 * 1024 * 1024,
+                    max_concurrency=8,
+                    use_threads=True,
+                ),
+            )
+        return size, calculated
+
+
 def execute_request(
     request: dict[str, Any],
     staging_root: Path = DEFAULT_STAGING_ROOT,
@@ -814,9 +864,10 @@ def execute_request(
                 )
                 transfer_method = "R2_MULTIPART_STREAMING"
             else:
-                size, digest, transfer_method = _transfer_large_model_parallel(
-                    artifact, client, bucket, hf_token,
+                size, digest = _transfer_model_via_xet(
+                    artifact, client, bucket, hf_token, staging_root,
                 )
+                transfer_method = "HF_XET_NATIVE_R2_MULTIPART"
 
         elif artifact["artifact_type"] == "CUSTOM_NODE_PACKAGE":
             repository_name = artifact["repository"].rsplit("/", 1)[-1]
