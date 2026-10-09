@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -452,6 +453,32 @@ def _upload_with_s5cmd(
     )
 
 
+def _publish_progress_json(
+    client: Any,
+    bucket: str,
+    result_channel: dict[str, Any],
+    progress: dict[str, Any],
+) -> None:
+    progress_key = (
+        result_channel["result_key"].rsplit("/", 1)[0]
+        + "/progress.json"
+    )
+
+    body = json.dumps(
+        progress,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    client.put_object(
+        Bucket=bucket,
+        Key=progress_key,
+        Body=body,
+        ContentType="application/json",
+    )
+
+
 def _publish_result_json(
     client: Any,
     bucket: str,
@@ -842,6 +869,8 @@ def execute_request(
 
     staging_root.mkdir(parents=True, exist_ok=True)
     evidence = []
+    result_channel = request.get("result_channel")
+    transfer_started_at = time.monotonic()
 
     for artifact in request["artifacts"]:
         if _head_or_none(
@@ -858,6 +887,52 @@ def execute_request(
         local_path = None
 
         if artifact["artifact_type"] == "MODEL_ARTIFACT":
+
+            def publish_progress(
+                done,
+                total,
+                attempt=1,
+                attempts=1,
+            ):
+                if result_channel is None:
+                    return
+
+                elapsed = max(
+                    time.monotonic()
+                    - transfer_started_at,
+                    0.001,
+                )
+
+                _publish_progress_json(
+                    client,
+                    bucket,
+                    result_channel,
+                    {
+                        "schema_version": "1.0",
+                        "status": "RUNNING",
+                        "transfer_id":
+                            result_channel["transfer_id"],
+                        "r2_key":
+                            artifact["r2_key"],
+                        "attempt": attempt,
+                        "attempts": attempts,
+                        "bytes_uploaded": done,
+                        "expected_size_bytes": total,
+                        "percent": round(
+                            (done / total) * 100,
+                            2,
+                        ),
+                        "bytes_per_second": round(
+                            done / elapsed,
+                            2,
+                        ),
+                        "elapsed_seconds": round(
+                            elapsed,
+                            2,
+                        ),
+                    },
+                )
+
             if artifact["expected_size_bytes"] < DEFAULT_MULTIPART_PART_SIZE:
                 size, digest = _stream_huggingface_to_r2_multipart(
                     artifact, client, bucket, hf_token,
@@ -865,9 +940,32 @@ def execute_request(
                 transfer_method = "R2_MULTIPART_STREAMING"
             else:
                 from dcf_xet_stream import transfer_xet_stream_to_r2
-                size, digest = transfer_xet_stream_to_r2(
-                    artifact, client, bucket, hf_token,
-                )
+
+                attempts = 3
+
+                for attempt in range(1, attempts + 1):
+                    try:
+                        size, digest = transfer_xet_stream_to_r2(
+                            artifact,
+                            client,
+                            bucket,
+                            hf_token,
+                            progress_callback=(
+                                lambda done, total, a=attempt:
+                                    publish_progress(
+                                        done,
+                                        total,
+                                        a,
+                                        attempts,
+                                    )
+                            ),
+                        )
+                        break
+
+                    except Exception:
+                        if attempt == attempts:
+                            raise
+
                 transfer_method = "HF_XET_STREAM_R2_MULTIPART"
 
         elif artifact["artifact_type"] == "CUSTOM_NODE_PACKAGE":
