@@ -583,6 +583,7 @@ def _stream_huggingface_to_r2_multipart(
     part_size: int | None = None,
     chunk_size: int = DEFAULT_STREAM_CHUNK_SIZE,
     upload_workers: int = 4,
+    byte_callback=None,
 ) -> tuple[int, str]:
     """Bounded streaming pipeline: Hugging Face download and parallel R2 uploads.
 
@@ -619,6 +620,8 @@ def _stream_huggingface_to_r2_multipart(
             Bucket=bucket, Key=r2_key, UploadId=upload_id,
             PartNumber=number, Body=body,
         )
+        if byte_callback is not None:
+            byte_callback(0, len(body))
         return {"ETag": result["ETag"], "PartNumber": number}
 
     try:
@@ -638,6 +641,8 @@ def _stream_huggingface_to_r2_multipart(
                     if not chunk:
                         continue
                     size += len(chunk)
+                    if byte_callback is not None:
+                        byte_callback(len(chunk), 0)
                     sha256.update(chunk)
                     buffer.extend(chunk)
                     while len(buffer) >= part_size:
@@ -888,54 +893,54 @@ def execute_request(
 
         if artifact["artifact_type"] == "MODEL_ARTIFACT":
 
-            def publish_progress(
-                done,
-                total,
-                attempt=1,
-                attempts=1,
-            ):
+            import threading
+            lock = threading.Lock()
+            counters = [0, 0]
+            artifact_started = time.monotonic()
+            last_publish = [0.0]
+            attempt = 1
+            attempts = 1
+
+            def publish_progress(done, total, attempt=1, attempts=1):
+                # Legacy callback retained for compatibility.
+                pass
+
+            def report_bytes(downloaded, uploaded):
                 if result_channel is None:
                     return
-
-                elapsed = max(
-                    time.monotonic()
-                    - transfer_started_at,
-                    0.001,
-                )
-
-                _publish_progress_json(
-                    client,
-                    bucket,
-                    result_channel,
-                    {
-                        "schema_version": "1.0",
-                        "status": "RUNNING",
-                        "transfer_id":
-                            result_channel["transfer_id"],
-                        "r2_key":
-                            artifact["r2_key"],
-                        "attempt": attempt,
-                        "attempts": attempts,
-                        "bytes_uploaded": done,
-                        "expected_size_bytes": total,
-                        "percent": round(
-                            (done / total) * 100,
-                            2,
-                        ),
-                        "bytes_per_second": round(
-                            done / elapsed,
-                            2,
-                        ),
-                        "elapsed_seconds": round(
-                            elapsed,
-                            2,
-                        ),
-                    },
-                )
+                with lock:
+                    counters[0] += downloaded
+                    counters[1] += uploaded
+                    now = time.monotonic()
+                    total = artifact["expected_size_bytes"]
+                    if now - last_publish[0] < 5 and counters[1] != total:
+                        return
+                    last_publish[0] = now
+                    elapsed = max(now - artifact_started, 0.001)
+                    verified = sum(item["size_bytes"] for item in evidence)
+                    try:
+                        _publish_progress_json(client, bucket, result_channel, {
+                            "schema_version": "1.0", "status": "RUNNING",
+                            "transfer_id": result_channel["transfer_id"],
+                            "r2_key": artifact["r2_key"],
+                            "attempt": attempt, "attempts": attempts,
+                            "bytes_downloaded": counters[0],
+                            "bytes_uploaded": counters[1],
+                            "expected_size_bytes": total,
+                            "percent": round(100 * counters[1] / total, 2),
+                            "download_bytes_per_second": counters[0] / elapsed,
+                            "bytes_per_second": counters[1] / elapsed,
+                            "elapsed_seconds": now - transfer_started_at,
+                            "total_bytes_downloaded": verified + counters[0],
+                            "total_bytes_uploaded": verified + counters[1],
+                            "verified_keys": [item["r2_key"] for item in evidence],
+                        })
+                    except Exception:
+                        pass
 
             if artifact["expected_size_bytes"] < DEFAULT_MULTIPART_PART_SIZE:
                 size, digest = _stream_huggingface_to_r2_multipart(
-                    artifact, client, bucket, hf_token,
+                    artifact, client, bucket, hf_token, byte_callback=report_bytes,
                 )
                 transfer_method = "R2_MULTIPART_STREAMING"
             else:
@@ -944,12 +949,16 @@ def execute_request(
                 attempts = 3
 
                 for attempt in range(1, attempts + 1):
+                    counters[:] = [0, 0]
+                    artifact_started = time.monotonic()
+                    last_publish[0] = 0.0
                     try:
                         size, digest = transfer_xet_stream_to_r2(
                             artifact,
                             client,
                             bucket,
                             hf_token,
+                            byte_callback=report_bytes,
                             progress_callback=(
                                 lambda done, total, a=attempt:
                                     publish_progress(

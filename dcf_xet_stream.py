@@ -19,6 +19,7 @@ def transfer_xet_stream_to_r2(
     part_size=32 * 1024 * 1024,
     upload_workers=2,
     progress_callback=None,
+    byte_callback=None,
 ):
     from hf_xet import XetFileInfo
     from huggingface_hub.file_download import (
@@ -128,6 +129,9 @@ def transfer_xet_stream_to_r2(
                 f"expected={wanted} actual={len(body)}"
             )
 
+        if byte_callback is not None:
+            byte_callback(len(body), 0)
+
         payload = bytes(body)
 
         result = client.upload_part(
@@ -137,6 +141,9 @@ def transfer_xet_stream_to_r2(
             PartNumber=part_number,
             Body=payload,
         )
+
+        if byte_callback is not None:
+            byte_callback(0, len(payload))
 
         return {
             "PartNumber": part_number,

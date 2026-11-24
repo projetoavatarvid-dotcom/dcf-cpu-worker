@@ -29,6 +29,7 @@ def test_large_model_routes_to_native_xet_stream(monkeypatch, tmp_path):
         token,
         *,
         progress_callback=None,
+        byte_callback=None,
     ):
         called.update(
             artifact=artifact,
@@ -103,10 +104,14 @@ def test_large_xet_retries_and_reports_attempt_number(
         token,
         *,
         progress_callback=None,
+        byte_callback=None,
     ):
         attempt = len(calls) + 1
         calls.append(attempt)
 
+        if byte_callback is not None:
+            byte_callback(artifact["expected_size_bytes"], 0)
+            byte_callback(0, artifact["expected_size_bytes"])
         if progress_callback is not None:
             progress_callback(
                 artifact["expected_size_bytes"],
@@ -197,7 +202,7 @@ def test_large_xet_retries_and_reports_attempt_number(
     assert [
         (item["attempt"], item["attempts"])
         for item in progress
-    ] == [(1, 3), (2, 3)]
+    ] == [(1, 3), (1, 3), (2, 3), (2, 3)]
 
     assert result["artifacts"][0]["transfer_method"] == (
         "HF_XET_STREAM_R2_MULTIPART"
